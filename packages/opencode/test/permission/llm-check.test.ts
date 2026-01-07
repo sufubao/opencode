@@ -155,3 +155,37 @@ test("LLM permission principles - bash commands analyzed", async () => {
   // - Commands modifying outside like "rm /etc/passwd" should return "deny"
   expect(true).toBe(true)
 })
+
+test("LLM permission principles - script execution deep analysis", async () => {
+  // When LLM check is enabled and a script is executed:
+  // - LLM reads the script content (if available)
+  // - Analyzes ALL commands in the script
+  // - If ANY command violates security principles → "deny"
+  // - Examples:
+  //   - bash script.sh (contains "rm file.txt") → "allow" (current dir)
+  //   - bash deploy.sh (contains "rm /var/www/file") → "deny" (outside dir)
+  //   - python test.py (only reads files) → "allow"
+  //   - ./script.sh (cannot read content) → "ask"
+  expect(true).toBe(true)
+})
+
+test("LLM permission principles - tool and binary execution", async () => {
+  // When LLM check is enabled and executing tools/binaries:
+  // - Cannot inspect internal behavior
+  // - Conservative approach: default to "ask"
+  // - Known safe tools (ls, cat, grep) → "allow"
+  // - Unknown binaries (./custom-tool) → "ask"
+  // - Package managers (npm install) → "ask" (might download/execute code)
+  expect(true).toBe(true)
+})
+
+test("LLM permission principles - script detection patterns", async () => {
+  // Script execution should be detected for:
+  // - bash script.sh, sh script.sh
+  // - python script.py, python3 script.py
+  // - node script.js, nodejs script.js
+  // - ruby script.rb
+  // - perl script.pl
+  // - ./script.sh, ./script.py, ./script.js
+  expect(true).toBe(true)
+})

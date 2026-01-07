@@ -9,6 +9,8 @@ import { Log } from "@/util/log"
 import { Wildcard } from "@/util/wildcard"
 import { generateText } from "ai"
 import { Provider } from "@/provider/provider"
+import path from "path"
+import fs from "fs/promises"
 import z from "zod"
 
 export namespace PermissionNext {
@@ -279,6 +281,59 @@ export namespace PermissionNext {
   }
 
   /**
+   * Detect if a bash command is executing a script and extract the script path
+   */
+  async function detectScriptExecution(
+    patterns: string[],
+    currentDirectory: string,
+  ): Promise<{ isScript: boolean; scriptPath?: string; scriptContent?: string }> {
+    for (const pattern of patterns) {
+      // Match common script execution patterns
+      const scriptPatterns = [
+        /^(bash|sh)\s+(.+\.sh)/i, // bash script.sh, sh script.sh
+        /^(python|python3)\s+(.+\.py)/i, // python script.py
+        /^(node|nodejs)\s+(.+\.js)/i, // node script.js
+        /^(ruby)\s+(.+\.rb)/i, // ruby script.rb
+        /^(perl)\s+(.+\.pl)/i, // perl script.pl
+        /^\.\/(.+\.sh)/i, // ./script.sh
+        /^\.\/(.+\.py)/i, // ./script.py
+        /^\.\/(.+\.js)/i, // ./script.js
+      ]
+
+      for (const regex of scriptPatterns) {
+        const match = pattern.match(regex)
+        if (match) {
+          // Extract script path (either from group 2 or group 1)
+          const scriptPath = match[2] || match[1]
+
+          try {
+            // Resolve absolute path
+            const absolutePath = path.isAbsolute(scriptPath)
+              ? scriptPath
+              : path.join(currentDirectory, scriptPath)
+
+            // Try to read the script content
+            const scriptContent = await fs.readFile(absolutePath, "utf-8")
+            log.info("Detected script execution", { scriptPath: absolutePath })
+
+            return {
+              isScript: true,
+              scriptPath: absolutePath,
+              scriptContent,
+            }
+          } catch (error) {
+            // Script file doesn't exist or can't be read
+            log.warn("Cannot read script file", { scriptPath, error })
+            return { isScript: true, scriptPath }
+          }
+        }
+      }
+    }
+
+    return { isScript: false }
+  }
+
+  /**
    * Use LLM to check if the operation should be allowed based on security principles:
    * 1. Cannot modify or delete anything outside the current directory
    * 2. All read operations are allowed
@@ -307,18 +362,51 @@ export namespace PermissionNext {
 
       const model = await Provider.getLanguage({ id: modelID, providerID: config.provider || "anthropic" })
 
+      // Detect if this is a script execution and try to read the script content
+      const scriptInfo = await detectScriptExecution(request.patterns, request.currentDirectory)
+
+      let scriptSection = ""
+      if (scriptInfo.isScript && scriptInfo.scriptContent) {
+        scriptSection = `
+
+**IMPORTANT: Script Execution Detected**
+The command is executing a script file. Here is the script content:
+
+\`\`\`
+${scriptInfo.scriptContent}
+\`\`\`
+
+You MUST analyze ALL commands in this script and ensure NONE of them:
+- Modify or delete files outside the current directory (${request.currentDirectory})
+- Execute dangerous operations like system-wide changes
+- Call other scripts or tools that might violate the security principles
+
+If ANY command in the script violates the security principles, return "deny".
+If the script is safe (only reads or modifies files inside current directory), return "allow".
+If uncertain, return "ask".`
+      } else if (scriptInfo.isScript && !scriptInfo.scriptContent) {
+        scriptSection = `
+
+**WARNING: Script Execution Detected**
+The command is executing a script file (${scriptInfo.scriptPath}), but the script content cannot be read.
+This could be risky because we cannot verify what the script will do.
+Consider returning "ask" or "deny" unless you are certain this is safe.`
+      }
+
       const prompt = `You are a security checker for a coding assistant. Your role is to determine if an operation should be allowed based on these strict security principles:
 
 1. **Modification Rule**: DENY any operations that modify or delete files/directories outside the current working directory
 2. **Read Rule**: ALLOW all read operations (reading files, listing directories, searching, etc.)
 3. **Command Rule**: For bash commands and scripts, they must follow rules 1 and 2
+4. **Script Rule**: When executing scripts, analyze the ENTIRE script content to ensure all commands follow the above rules
+5. **Tool Rule**: For executing tools/binaries, use conservative approach - if unsure, choose "ask"
 
 **Current Working Directory**: ${request.currentDirectory}
 
 **Operation Details**:
 - Permission Type: ${request.permission}
 - Patterns: ${request.patterns.join(", ")}
-- Metadata: ${JSON.stringify(request.metadata, null, 2)}
+- Metadata: ${JSON.stringify(request.metadata, null, 2)}${scriptSection}
 
 **Your Task**: Analyze this operation and respond with ONLY a JSON object in this exact format:
 {
@@ -334,6 +422,10 @@ export namespace PermissionNext {
   - Commands like "cat", "ls", "grep" → "allow"
   - Commands like "rm", "mv", "cp" outside current dir → "deny"
   - Commands like "rm", "mv", "cp" inside current dir → "allow"
+  - Script execution with safe content → "allow"
+  - Script execution with unsafe content → "deny"
+  - Script execution with unreadable content → "ask"
+  - Tool/binary execution with unknown behavior → "ask"
   - If unclear → "ask"
 - If uncertain about the safety → "ask"
 
@@ -342,7 +434,7 @@ Respond with ONLY the JSON object, no other text.`
       const result = await generateText({
         model,
         prompt,
-        maxTokens: 500,
+        maxTokens: 1000, // Increased for script analysis
       })
 
       const response = JSON.parse(result.text.trim()) as { action: Action; reason: string }
@@ -350,6 +442,7 @@ Respond with ONLY the JSON object, no other text.`
       log.info("LLM permission check result", {
         permission: request.permission,
         patterns: request.patterns,
+        isScript: scriptInfo.isScript,
         action: response.action,
         reason: response.reason,
       })
