@@ -918,6 +918,21 @@ export namespace Config {
       instructions: z.array(z.string()).optional().describe("Additional instruction files or patterns to include"),
       layout: Layout.optional().describe("@deprecated Always uses stretch layout."),
       permission: Permission.optional(),
+      llmPermissionCheck: z
+        .object({
+          enabled: z
+            .boolean()
+            .optional()
+            .describe(
+              "Enable LLM-based permission checking. When enabled, an LLM will evaluate operations based on security principles: 1) Cannot modify/delete outside current directory, 2) All read operations allowed, 3) Commands must follow these rules",
+            ),
+          model: z
+            .string()
+            .optional()
+            .describe("Model to use for LLM permission checks. If not specified, uses the default model"),
+        })
+        .optional()
+        .describe("Configure LLM-based permission checking for enhanced security"),
       tools: z.record(z.string(), z.boolean()).optional(),
       enterprise: z
         .object({

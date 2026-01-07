@@ -7,6 +7,8 @@ import { Storage } from "@/storage/storage"
 import { fn } from "@/util/fn"
 import { Log } from "@/util/log"
 import { Wildcard } from "@/util/wildcard"
+import { generateText } from "ai"
+import { Provider } from "@/provider/provider"
 import z from "zod"
 
 export namespace PermissionNext {
@@ -120,11 +122,61 @@ export namespace PermissionNext {
     async (input) => {
       const s = await state()
       const { ruleset, ...request } = input
+
+      // Check if LLM permission check is enabled
+      const config = await Config.get()
+      const llmCheckEnabled = config.llmPermissionCheck?.enabled === true
+
       for (const pattern of request.patterns ?? []) {
         const rule = evaluate(request.permission, pattern, ruleset, s.approved)
         log.info("evaluated", { permission: request.permission, pattern, action: rule })
+
         if (rule.action === "deny")
           throw new DeniedError(ruleset.filter((r) => Wildcard.match(request.permission, r.permission)))
+
+        // If LLM check is enabled and the rule allows, do an additional LLM check
+        if (llmCheckEnabled && rule.action === "allow") {
+          const llmResult = await checkWithLLM({
+            permission: request.permission,
+            patterns: request.patterns,
+            metadata: request.metadata,
+            currentDirectory: Instance.directory,
+          })
+
+          log.info("LLM check decision", {
+            permission: request.permission,
+            pattern,
+            llmAction: llmResult.action,
+            reason: llmResult.reason,
+          })
+
+          if (llmResult.action === "deny") {
+            throw new LLMDeniedError(llmResult.reason)
+          }
+
+          if (llmResult.action === "ask") {
+            const id = input.id ?? Identifier.ascending("permission")
+            return new Promise<void>((resolve, reject) => {
+              const info: Request = {
+                id,
+                ...request,
+                metadata: {
+                  ...request.metadata,
+                  llmReason: llmResult.reason,
+                },
+              }
+              s.pending[id] = {
+                info,
+                resolve,
+                reject,
+              }
+              Bus.publish(Event.Asked, info)
+            })
+          }
+
+          // If llmResult.action === "allow", continue
+        }
+
         if (rule.action === "ask") {
           const id = input.id ?? Identifier.ascending("permission")
           return new Promise<void>((resolve, reject) => {
@@ -226,6 +278,90 @@ export namespace PermissionNext {
     return match ?? { action: "ask", permission, pattern: "*" }
   }
 
+  /**
+   * Use LLM to check if the operation should be allowed based on security principles:
+   * 1. Cannot modify or delete anything outside the current directory
+   * 2. All read operations are allowed
+   * 3. Scripts and commands must follow the above rules
+   */
+  export async function checkWithLLM(request: {
+    permission: string
+    patterns: string[]
+    metadata: Record<string, any>
+    currentDirectory: string
+  }): Promise<{ action: Action; reason: string }> {
+    try {
+      const config = await Config.get()
+
+      // Check if LLM permission check is enabled
+      if (!config.llmPermissionCheck?.enabled) {
+        return { action: "allow", reason: "LLM permission check is disabled" }
+      }
+
+      // Get the model for LLM permission check
+      const modelID = config.llmPermissionCheck?.model || config.model
+      if (!modelID) {
+        log.warn("No model specified for LLM permission check, skipping")
+        return { action: "allow", reason: "No model configured for LLM check" }
+      }
+
+      const model = await Provider.getLanguage({ id: modelID, providerID: config.provider || "anthropic" })
+
+      const prompt = `You are a security checker for a coding assistant. Your role is to determine if an operation should be allowed based on these strict security principles:
+
+1. **Modification Rule**: DENY any operations that modify or delete files/directories outside the current working directory
+2. **Read Rule**: ALLOW all read operations (reading files, listing directories, searching, etc.)
+3. **Command Rule**: For bash commands and scripts, they must follow rules 1 and 2
+
+**Current Working Directory**: ${request.currentDirectory}
+
+**Operation Details**:
+- Permission Type: ${request.permission}
+- Patterns: ${request.patterns.join(", ")}
+- Metadata: ${JSON.stringify(request.metadata, null, 2)}
+
+**Your Task**: Analyze this operation and respond with ONLY a JSON object in this exact format:
+{
+  "action": "allow" | "deny" | "ask",
+  "reason": "Brief explanation of your decision"
+}
+
+**Decision Logic**:
+- If it's a read operation (read, grep, glob, list, etc.) → "allow"
+- If it's modifying/deleting INSIDE current directory → "allow"
+- If it's modifying/deleting OUTSIDE current directory → "deny"
+- If it's a bash command, analyze what it does:
+  - Commands like "cat", "ls", "grep" → "allow"
+  - Commands like "rm", "mv", "cp" outside current dir → "deny"
+  - Commands like "rm", "mv", "cp" inside current dir → "allow"
+  - If unclear → "ask"
+- If uncertain about the safety → "ask"
+
+Respond with ONLY the JSON object, no other text.`
+
+      const result = await generateText({
+        model,
+        prompt,
+        maxTokens: 500,
+      })
+
+      const response = JSON.parse(result.text.trim()) as { action: Action; reason: string }
+
+      log.info("LLM permission check result", {
+        permission: request.permission,
+        patterns: request.patterns,
+        action: response.action,
+        reason: response.reason,
+      })
+
+      return response
+    } catch (error) {
+      log.error("Error in LLM permission check", { error })
+      // On error, default to asking the user
+      return { action: "ask", reason: `LLM check failed: ${error}` }
+    }
+  }
+
   const EDIT_TOOLS = ["edit", "write", "patch", "multiedit"]
 
   export function disabled(tools: string[], ruleset: Ruleset): Set<string> {
@@ -259,6 +395,15 @@ export namespace PermissionNext {
     constructor(public readonly ruleset: Ruleset) {
       super(
         `The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules ${JSON.stringify(ruleset)}`,
+      )
+    }
+  }
+
+  /** Auto-rejected by LLM security check - halts execution */
+  export class LLMDeniedError extends Error {
+    constructor(reason: string) {
+      super(
+        `The LLM security checker has determined that this operation violates security principles. Reason: ${reason}`,
       )
     }
   }

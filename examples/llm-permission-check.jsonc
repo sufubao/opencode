@@ -1,0 +1,66 @@
+// Example configuration for LLM-based permission checking
+// Place this in your project's opencode.json or opencode.jsonc file
+
+{
+  // Enable LLM-based permission checking
+  "llmPermissionCheck": {
+    // Set to true to enable LLM permission checking
+    "enabled": true,
+
+    // Optional: specify which model to use for permission checks
+    // If not specified, uses the default model from the "model" field
+    "model": "anthropic/claude-sonnet-4"
+  },
+
+  // Default model for general operations
+  "model": "anthropic/claude-sonnet-4",
+  "provider": "anthropic",
+
+  // Standard permission rules still apply
+  // LLM check is an additional layer on top of these rules
+  "permission": {
+    // Allow read operations by default
+    "read": "allow",
+    "grep": "allow",
+    "glob": "allow",
+    "list": "allow",
+
+    // Ask for edit operations (LLM will additionally check if they're safe)
+    "edit": {
+      "*": "allow"
+    },
+
+    // Allow bash commands (LLM will check if they're safe)
+    "bash": {
+      "*": "allow"
+    },
+
+    // Deny external directory access by default (LLM will enforce this)
+    "external_directory": "ask"
+  }
+}
+
+// How LLM Permission Checking Works:
+//
+// When enabled, the LLM will evaluate each operation based on these principles:
+//
+// 1. Read Operations: Always allowed
+//    - read, grep, glob, list, etc. will pass LLM check
+//
+// 2. Modifications Inside Current Directory: Allowed
+//    - edit, write, bash commands that modify files in current directory
+//
+// 3. Modifications Outside Current Directory: Denied
+//    - Operations trying to modify/delete files outside current directory
+//    - Example: "rm /etc/passwd" will be denied by LLM
+//    - Example: "mv ../file ./file" will be denied by LLM
+//
+// 4. Bash Commands: Analyzed
+//    - Safe read commands: "ls", "cat", "grep" → allowed
+//    - Modifications inside current dir: "touch file.txt" → allowed
+//    - Modifications outside current dir: "rm /etc/passwd" → denied
+//    - Uncertain commands → asks user
+//
+// The LLM check is performed AFTER the standard permission rules are evaluated.
+// If standard rules deny something, LLM is not consulted.
+// If standard rules allow something, LLM provides an additional security layer.
